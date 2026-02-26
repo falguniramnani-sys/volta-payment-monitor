@@ -9,6 +9,7 @@ Pages:
   2. PSP Performance — Side-by-side PSP comparison
   3. Drill-Down Analysis — Filtered deep-dive
   4. Bottleneck Finder — Heatmaps and worst combinations
+  5. Routing Recommendations — Smart PSP routing with impact estimates
 """
 
 import sys
@@ -34,6 +35,7 @@ from src.pipeline import (
     compute_worst_combinations,
     compute_method_metrics,
 )
+from src.routing import compute_routing_recommendations, compute_score_breakdown
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -84,6 +86,7 @@ page = st.sidebar.radio(
         "PSP Performance",
         "Drill-Down Analysis",
         "Bottleneck Finder",
+        "Routing Recommendations",
     ],
 )
 
@@ -417,3 +420,76 @@ elif page == "Bottleneck Finder":
         display_worst["approval_rate"] = display_worst["approval_rate"].map("{:.1%}".format)
         display_worst["timeout_rate"] = display_worst["timeout_rate"].map("{:.1%}".format)
         st.dataframe(display_worst, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page 5: Routing Recommendations
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Routing Recommendations":
+    st.title("Smart Routing Recommendations")
+    st.markdown(
+        "Optimal PSP selection per route based on latency (40%), "
+        "approval rate (40%), and reliability (20%)."
+    )
+
+    recommendations = compute_routing_recommendations(df)
+
+    if recommendations.empty:
+        st.warning("No routing recommendations available.")
+    else:
+        # Impact summary
+        total_impact = recommendations[recommendations["impact_p95_ms"] > 0]
+        if not total_impact.empty:
+            total_txns_impacted = total_impact["volume"].sum()
+            avg_improvement = total_impact["impact_p95_ms"].mean()
+            st.success(
+                f"**Potential Impact:** Optimizing {total_txns_impacted:,} transactions "
+                f"could reduce average P95 by {avg_improvement/1000:.1f}s"
+            )
+
+        # Recommendations table
+        st.subheader("Routing Table")
+        display_rec = recommendations[[
+            "country", "payment_method", "volume",
+            "recommended_psp", "rec_score",
+            "current_best_psp", "current_score",
+            "expected_p95", "expected_approval",
+            "impact_p95_ms", "impact_description",
+        ]].copy()
+        display_rec["expected_p95"] = display_rec["expected_p95"].map("{:,.0f}ms".format)
+        display_rec["expected_approval"] = display_rec["expected_approval"].map("{:.1%}".format)
+        display_rec["impact_p95_ms"] = display_rec["impact_p95_ms"].map("{:+,.0f}ms".format)
+        st.dataframe(display_rec, use_container_width=True, hide_index=True)
+
+        # Health score breakdown
+        st.subheader("Health Score Breakdown by Route")
+        breakdown = compute_score_breakdown(df)
+
+        if not breakdown.empty:
+            fig_breakdown = px.bar(
+                breakdown,
+                x="psp",
+                y=["latency_component", "approval_component", "reliability_component"],
+                color_discrete_map={
+                    "latency_component": "#636EFA",
+                    "approval_component": "#00CC96",
+                    "reliability_component": "#FFA726",
+                },
+                facet_col="country",
+                facet_row="payment_method",
+                barmode="stack",
+                height=600,
+            )
+            fig_breakdown.update_layout(
+                yaxis_title="Score",
+                legend_title="Component",
+            )
+            fig_breakdown.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+            st.plotly_chart(fig_breakdown, use_container_width=True)
+
+        # Per-route details
+        st.subheader("Route Impact Details")
+        for _, row in recommendations.iterrows():
+            if row["impact_description"]:
+                st.markdown(f"- **{row['country']}/{row['payment_method']}**: {row['impact_description']}")
