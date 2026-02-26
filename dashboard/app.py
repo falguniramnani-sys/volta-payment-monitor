@@ -19,12 +19,15 @@ import os
 # Allow imports from project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import time
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 
 from src.pipeline import (
     load_transactions,
@@ -40,6 +43,7 @@ from src.pipeline import (
 )
 from src.routing import compute_routing_recommendations, compute_score_breakdown
 from src.alerting import detect_alerts, get_alert_summary
+from src.validation import validate_csv_schema, sanitize_dataframe, compute_fingerprint
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -65,17 +69,29 @@ SEVERITY_COLORS = {"critical": "#FF4B4B", "warning": "#FFA726"}
 # ── Data loading (cached) ────────────────────────────────────────────────────
 
 @st.cache_data
-def get_data():
+def load_default_data():
     return load_transactions()
 
 
+def get_active_dataframe():
+    """Return (df, fingerprint, source_label) from upload or default."""
+    if "uploaded_df" in st.session_state:
+        return (
+            st.session_state["uploaded_df"],
+            st.session_state["data_fingerprint"],
+            st.session_state["data_source"],
+        )
+    df = load_default_data()
+    return df, "default", "Default dataset"
+
+
 @st.cache_data
-def get_psp_metrics(_df):
+def get_psp_metrics(_df, data_fingerprint: str):
     return compute_psp_metrics(_df)
 
 
 @st.cache_data
-def get_timeseries(_df):
+def get_timeseries(_df, data_fingerprint: str):
     return compute_timeseries(_df)
 
 
@@ -83,6 +99,129 @@ def get_timeseries(_df):
 
 st.sidebar.title("⚡ Volta Payment Monitor")
 st.sidebar.markdown("---")
+
+# ── Data Source section ──────────────────────────────────────────────────────
+
+with st.sidebar.expander("Data Source", expanded=False):
+    # Status indicator
+    _, _, _current_source = get_active_dataframe()
+    if "uploaded_df" in st.session_state:
+        _row_count = len(st.session_state["uploaded_df"])
+        st.caption(f"Active: **{st.session_state['data_source']}** ({_row_count:,} rows)")
+    else:
+        _default_count = len(load_default_data())
+        st.caption(f"Active: **Default dataset** ({_default_count:,} rows)")
+
+    # File uploader
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader")
+
+    if uploaded_file is not None:
+        # Only process if this is a new file (not already loaded)
+        _already_loaded = (
+            "uploaded_df" in st.session_state
+            and st.session_state.get("data_source") == uploaded_file.name
+        )
+        if not _already_loaded:
+            with st.status("Processing upload...", expanded=True) as status:
+                # Stage 1: Read CSV
+                st.write("Reading CSV file...")
+                try:
+                    raw_df = pd.read_csv(uploaded_file)
+                except Exception as e:
+                    st.error(f"Failed to read CSV: {e}")
+                    status.update(label="Upload failed", state="error")
+                    raw_df = None
+
+                if raw_df is not None:
+                    # Stage 2: Validate schema
+                    st.write("Validating schema...")
+                    fatal_errors, warnings = validate_csv_schema(raw_df)
+
+                    for w in warnings:
+                        st.warning(w)
+
+                    if fatal_errors:
+                        for err in fatal_errors:
+                            st.error(err)
+                        status.update(label="Validation failed", state="error")
+                    else:
+                        # Stage 3: Clean data
+                        st.write("Cleaning data...")
+                        clean_df = sanitize_dataframe(raw_df)
+                        fingerprint = compute_fingerprint(clean_df)
+
+                        # Stage 4: Pre-compute metrics
+                        st.write("Computing metrics...")
+                        get_psp_metrics(clean_df, fingerprint)
+                        get_timeseries(clean_df, fingerprint)
+
+                        # Store in session state
+                        st.session_state["uploaded_df"] = clean_df
+                        st.session_state["data_fingerprint"] = fingerprint
+                        st.session_state["data_source"] = uploaded_file.name
+
+                        status.update(
+                            label=f"Loaded {len(clean_df):,} transactions from {uploaded_file.name}",
+                            state="complete",
+                        )
+                        st.rerun()
+
+    # Reset button (only when uploaded data is active)
+    if "uploaded_df" in st.session_state:
+        if st.button("Reset to default data"):
+            del st.session_state["uploaded_df"]
+            del st.session_state["data_fingerprint"]
+            del st.session_state["data_source"]
+            st.cache_data.clear()
+            st.rerun()
+
+    # ── Webhook Polling (optional) ───────────────────────────────────────────
+    with st.expander("Webhook Polling"):
+        webhook_url = st.text_input("CSV URL", key="webhook_url")
+        poll_interval = st.select_slider(
+            "Poll interval",
+            options=[1, 5, 10, 15, 30, 60],
+            value=5,
+            format_func=lambda x: f"{x} min",
+            key="poll_interval",
+        )
+        webhook_enabled = st.toggle("Enable polling", key="webhook_enabled")
+
+        if webhook_enabled and webhook_url:
+            now = time.time()
+            last_poll = st.session_state.get("webhook_last_poll", 0)
+            interval_sec = poll_interval * 60
+
+            if now - last_poll >= interval_sec:
+                try:
+                    resp = requests.get(webhook_url, timeout=30)
+                    resp.raise_for_status()
+                    from io import StringIO
+                    raw_df = pd.read_csv(StringIO(resp.text))
+                    fatal_errors, _ = validate_csv_schema(raw_df)
+                    if not fatal_errors:
+                        clean_df = sanitize_dataframe(raw_df)
+                        fingerprint = compute_fingerprint(clean_df)
+                        old_fp = st.session_state.get("data_fingerprint")
+                        if fingerprint != old_fp:
+                            st.session_state["uploaded_df"] = clean_df
+                            st.session_state["data_fingerprint"] = fingerprint
+                            st.session_state["data_source"] = f"Webhook: {webhook_url[:40]}"
+                            st.session_state["webhook_last_poll"] = now
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.session_state["webhook_last_poll"] = now
+                    else:
+                        st.error("Webhook data failed validation.")
+                        st.session_state["webhook_last_poll"] = now
+                except Exception as e:
+                    st.error(f"Webhook fetch failed: {e}")
+                    st.session_state["webhook_last_poll"] = now
+            else:
+                remaining = int(interval_sec - (now - last_poll))
+                st.caption(f"Next poll in {remaining}s")
+
 
 page = st.sidebar.radio(
     "Navigation",
@@ -103,7 +242,11 @@ st.sidebar.caption("Brazil · Mexico · Colombia")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-df = get_data()
+df, data_fingerprint, data_source_label = get_active_dataframe()
+
+# Data source banner (visible when using uploaded data)
+if data_fingerprint != "default":
+    st.caption(f"Data source: {data_source_label} ({len(df):,} rows)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -132,7 +275,7 @@ if page == "Overview":
     # Time-series: latency trends
     st.subheader("Latency Trends (48 Hours)")
 
-    ts = get_timeseries(df)
+    ts = get_timeseries(df, data_fingerprint)
 
     # Aggregate across PSPs for overall view
     ts_overall = ts.groupby("timestamp_hour").agg(
@@ -205,7 +348,7 @@ if page == "Overview":
 elif page == "PSP Performance":
     st.title("PSP Performance Comparison")
 
-    metrics = get_psp_metrics(df)
+    metrics = get_psp_metrics(df, data_fingerprint)
 
     # Side-by-side bar chart: P50/P95/P99
     st.subheader("Latency Percentiles by PSP")

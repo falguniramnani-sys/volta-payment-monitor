@@ -9,12 +9,14 @@ volta-payment-monitor/
 ├── src/
 │   ├── data_generator.py   # Synthetic data: 15K transactions, 4 PSPs, 3 countries
 │   ├── pipeline.py         # Metrics engine: P50/P95/P99, heatmaps, anomaly detection
+│   ├── validation.py       # CSV schema validation, sanitization, fingerprinting
 │   ├── alerting.py         # Alert rules: latency spikes, timeout/approval thresholds
 │   └── routing.py          # Smart routing: health-score-based PSP recommendations
 ├── dashboard/
 │   └── app.py              # Streamlit dashboard with 6 interactive pages
 ├── data/
-│   └── transactions.csv    # Generated dataset (gitignored)
+│   ├── transactions.csv    # Generated dataset (gitignored)
+│   └── sample_upload.csv   # 100-row sample for testing upload feature
 └── docs/
     └── bottleneck_analysis.md
 ```
@@ -55,6 +57,47 @@ streamlit run dashboard/app.py
 4. **Bottleneck Finder** — P95 heatmaps (PSP x Country, PSP x Method), worst combination ranking
 5. **Routing Recommendations** — Health-score-based optimal PSP per route with impact estimates
 6. **Alerts** — Active alerts with severity badges, timeline visualization, rule configuration
+
+## Data Ingestion
+
+The dashboard supports three ways to load transaction data:
+
+### CSV Upload
+
+Click the **Data Source** expander in the sidebar to upload a CSV file. The upload pipeline validates the schema, cleans the data, and pre-computes metrics before displaying results. A 4-stage processing animation shows progress.
+
+### Expected CSV Schema
+
+| Column | Type | Required |
+|--------|------|----------|
+| `id` | string | Yes |
+| `timestamp` | datetime | Yes |
+| `psp` | string | Yes |
+| `country` | string | Yes |
+| `payment_method` | string | Yes |
+| `card_brand` | string | Yes |
+| `latency_ms` | float | Yes |
+| `status` | string (`approved`, `declined`, `timeout`) | Yes |
+
+Minimum 10 rows required. Extra columns are ignored with a warning.
+
+### Webhook Polling (Optional)
+
+Inside the Data Source expander, expand **Webhook Polling** to configure:
+- Enter a URL that returns CSV data
+- Set the poll interval (1–60 minutes)
+- Enable the toggle to start polling
+
+The dashboard checks on each rerun whether enough time has elapsed and only updates if the data fingerprint has changed.
+
+### Testing Upload
+
+A sample file is included for testing:
+
+```bash
+# Upload data/sample_upload.csv through the sidebar
+# 100 transactions from 2024-07-15 (different from default dataset)
+```
 
 ## Metrics Pipeline
 
