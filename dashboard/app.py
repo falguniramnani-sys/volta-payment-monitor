@@ -7,6 +7,8 @@ across PSPs, countries, and payment methods.
 Pages:
   1. Overview — KPIs and time-series trends
   2. PSP Performance — Side-by-side PSP comparison
+  3. Drill-Down Analysis — Filtered deep-dive
+  4. Bottleneck Finder — Heatmaps and worst combinations
 """
 
 import sys
@@ -23,8 +25,14 @@ import plotly.graph_objects as go
 
 from src.pipeline import (
     load_transactions,
+    apply_filters,
     compute_psp_metrics,
     compute_timeseries,
+    compute_histogram,
+    compute_country_psp_heatmap,
+    compute_method_psp_heatmap,
+    compute_worst_combinations,
+    compute_method_metrics,
 )
 
 
@@ -74,6 +82,8 @@ page = st.sidebar.radio(
     [
         "Overview",
         "PSP Performance",
+        "Drill-Down Analysis",
+        "Bottleneck Finder",
     ],
 )
 
@@ -256,3 +266,154 @@ elif page == "PSP Performance":
     display_metrics["timeout_rate"] = display_metrics["timeout_rate"].map("{:.1%}".format)
     display_metrics["decline_rate"] = display_metrics["decline_rate"].map("{:.1%}".format)
     st.dataframe(display_metrics, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page 3: Drill-Down Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Drill-Down Analysis":
+    st.title("Drill-Down Analysis")
+
+    # Sidebar filters
+    st.sidebar.markdown("### Filters")
+
+    sel_countries = st.sidebar.multiselect(
+        "Country", df["country"].unique().tolist(), default=df["country"].unique().tolist()
+    )
+    sel_methods = st.sidebar.multiselect(
+        "Payment Method", df["payment_method"].unique().tolist(),
+        default=df["payment_method"].unique().tolist()
+    )
+    sel_psps = st.sidebar.multiselect(
+        "PSP", df["psp"].unique().tolist(), default=df["psp"].unique().tolist()
+    )
+
+    min_time = df["timestamp"].min().to_pydatetime()
+    max_time = df["timestamp"].max().to_pydatetime()
+    time_range = st.sidebar.slider(
+        "Time Range",
+        min_value=min_time,
+        max_value=max_time,
+        value=(min_time, max_time),
+        format="MM/DD HH:mm",
+    )
+
+    filtered = apply_filters(
+        df,
+        countries=sel_countries or None,
+        methods=sel_methods or None,
+        psps=sel_psps or None,
+        start_time=time_range[0],
+        end_time=time_range[1],
+    )
+
+    st.info(f"Showing **{len(filtered):,}** of {len(df):,} transactions")
+
+    # Latency histogram
+    st.subheader("Latency Distribution")
+    non_to_filtered = filtered[filtered["status"] != "timeout"]
+
+    if len(non_to_filtered) > 0:
+        fig_hist = px.histogram(
+            non_to_filtered, x="latency_ms", color="psp",
+            nbins=50, barmode="overlay", opacity=0.7,
+            color_discrete_map=COLORS,
+        )
+        fig_hist.update_layout(
+            xaxis_title="Latency (ms)", yaxis_title="Count", height=400,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+    else:
+        st.warning("No non-timeout transactions match the selected filters.")
+
+    # Time-series with applied filters
+    st.subheader("Latency Trends (Filtered)")
+    if len(filtered) > 0:
+        ts_filtered = compute_timeseries(filtered)
+        if len(ts_filtered) > 0:
+            fig_ts_f = px.line(
+                ts_filtered, x="timestamp_hour", y="p95", color="psp",
+                color_discrete_map=COLORS,
+                markers=True,
+            )
+            fig_ts_f.update_layout(
+                yaxis_title="P95 Latency (ms)", xaxis_title="Time", height=400,
+            )
+            st.plotly_chart(fig_ts_f, use_container_width=True)
+
+    # Comparison table
+    st.subheader("Filtered Metrics by PSP")
+    if len(filtered) > 0:
+        filtered_metrics = compute_psp_metrics(filtered)
+        display = filtered_metrics[["p50", "p95", "p99", "approval_rate", "timeout_rate", "count", "health_score"]].copy()
+        display["approval_rate"] = display["approval_rate"].map("{:.1%}".format)
+        display["timeout_rate"] = display["timeout_rate"].map("{:.1%}".format)
+        st.dataframe(display, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page 4: Bottleneck Finder
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Bottleneck Finder":
+    st.title("Bottleneck Finder")
+
+    # Worst bottleneck callout
+    worst = compute_worst_combinations(df, top_n=1)
+    if not worst.empty:
+        w = worst.iloc[0]
+        st.error(
+            f"**Worst Bottleneck:** {w['country']} / {w['payment_method']} / {w['psp']} "
+            f"— P95: {w['p95']:,.0f}ms | Approval: {w['approval_rate']:.1%} | "
+            f"Timeout: {w['timeout_rate']:.1%} | {w['count']} transactions"
+        )
+
+    st.markdown("---")
+
+    # Heatmap: PSP x Country
+    st.subheader("P95 Latency: PSP x Country")
+    heatmap_country = compute_country_psp_heatmap(df)
+
+    fig_hm1 = px.imshow(
+        heatmap_country.values,
+        x=heatmap_country.columns.tolist(),
+        y=heatmap_country.index.tolist(),
+        color_continuous_scale="RdYlGn_r",
+        text_auto=".0f",
+        aspect="auto",
+    )
+    fig_hm1.update_layout(
+        xaxis_title="PSP", yaxis_title="Country", height=350,
+        coloraxis_colorbar_title="P95 (ms)",
+    )
+    st.plotly_chart(fig_hm1, use_container_width=True)
+
+    # Heatmap: PSP x Payment Method
+    st.subheader("P95 Latency: PSP x Payment Method")
+    heatmap_method = compute_method_psp_heatmap(df)
+
+    fig_hm2 = px.imshow(
+        heatmap_method.values,
+        x=heatmap_method.columns.tolist(),
+        y=heatmap_method.index.tolist(),
+        color_continuous_scale="RdYlGn_r",
+        text_auto=".0f",
+        aspect="auto",
+    )
+    fig_hm2.update_layout(
+        xaxis_title="PSP", yaxis_title="Payment Method", height=350,
+        coloraxis_colorbar_title="P95 (ms)",
+    )
+    st.plotly_chart(fig_hm2, use_container_width=True)
+
+    # Ranked table of worst combinations
+    st.subheader("Top 10 Worst-Performing Combinations")
+    worst_10 = compute_worst_combinations(df, top_n=10)
+    if not worst_10.empty:
+        display_worst = worst_10.copy()
+        display_worst["p95"] = display_worst["p95"].map("{:,.0f}ms".format)
+        display_worst["p50"] = display_worst["p50"].map("{:,.0f}ms".format)
+        display_worst["approval_rate"] = display_worst["approval_rate"].map("{:.1%}".format)
+        display_worst["timeout_rate"] = display_worst["timeout_rate"].map("{:.1%}".format)
+        st.dataframe(display_worst, use_container_width=True, hide_index=True)
