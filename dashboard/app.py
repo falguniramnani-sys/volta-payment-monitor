@@ -10,6 +10,7 @@ Pages:
   3. Drill-Down Analysis — Filtered deep-dive
   4. Bottleneck Finder — Heatmaps and worst combinations
   5. Routing Recommendations — Smart PSP routing with impact estimates
+  6. Alerts — Active alerts and history
 """
 
 import sys
@@ -23,6 +24,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from src.pipeline import (
     load_transactions,
@@ -34,8 +36,10 @@ from src.pipeline import (
     compute_method_psp_heatmap,
     compute_worst_combinations,
     compute_method_metrics,
+    detect_anomalies,
 )
 from src.routing import compute_routing_recommendations, compute_score_breakdown
+from src.alerting import detect_alerts, get_alert_summary
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -55,6 +59,7 @@ COLORS = {
     "PSP_Gamma": "#00CC96",
     "PSP_Delta": "#AB63FA",
 }
+SEVERITY_COLORS = {"critical": "#FF4B4B", "warning": "#FFA726"}
 
 
 # ── Data loading (cached) ────────────────────────────────────────────────────
@@ -87,6 +92,7 @@ page = st.sidebar.radio(
         "Drill-Down Analysis",
         "Bottleneck Finder",
         "Routing Recommendations",
+        "Alerts",
     ],
 )
 
@@ -493,3 +499,101 @@ elif page == "Routing Recommendations":
         for _, row in recommendations.iterrows():
             if row["impact_description"]:
                 st.markdown(f"- **{row['country']}/{row['payment_method']}**: {row['impact_description']}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page 6: Alerts
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Alerts":
+    st.title("Alert Dashboard")
+
+    alerts = detect_alerts(df)
+    summary = get_alert_summary(alerts)
+
+    # Summary cards
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Alerts", summary["total"])
+    col2.metric("Critical", summary["critical"])
+    col3.metric("Warning", summary["warning"])
+
+    st.markdown("---")
+
+    # Active alerts panel
+    st.subheader("Active Alerts")
+
+    if not alerts:
+        st.success("No active alerts.")
+    else:
+        # Separate critical and warning
+        critical_alerts = [a for a in alerts if a["severity"] == "critical"]
+        warning_alerts = [a for a in alerts if a["severity"] == "warning"]
+
+        if critical_alerts:
+            st.markdown("#### Critical")
+            for a in critical_alerts:
+                ts_str = a["timestamp"].strftime("%Y-%m-%d %H:%M") if a["timestamp"] else "Overall"
+                st.error(f"🔴 **{a['type']}** | {a['psp']} | {ts_str}\n\n{a['message']}")
+
+        if warning_alerts:
+            st.markdown("#### Warning")
+            for a in warning_alerts:
+                ts_str = a["timestamp"].strftime("%Y-%m-%d %H:%M") if a["timestamp"] else "Overall"
+                st.warning(f"🟡 **{a['type']}** | {a['psp']} | {ts_str}\n\n{a['message']}")
+
+    st.markdown("---")
+
+    # Alert history timeline
+    st.subheader("Alert Timeline")
+    timed_alerts = [a for a in alerts if a["timestamp"] is not None]
+    if timed_alerts:
+        alert_df = pd.DataFrame(timed_alerts)
+        alert_df["hour"] = alert_df["timestamp"]
+
+        fig_timeline = px.scatter(
+            alert_df,
+            x="hour",
+            y="psp",
+            color="severity",
+            size_max=12,
+            color_discrete_map=SEVERITY_COLORS,
+            hover_data=["type", "message", "current_value"],
+        )
+        fig_timeline.update_traces(marker_size=10)
+        fig_timeline.update_layout(
+            xaxis_title="Time", yaxis_title="PSP", height=350,
+        )
+        st.plotly_chart(fig_timeline, use_container_width=True)
+    else:
+        st.info("No time-based alerts to display.")
+
+    # Alert configuration display
+    st.subheader("Alert Configuration")
+    config_data = {
+        "Rule": ["P95 Spike", "P95 Spike", "Timeout Rate", "Timeout Rate",
+                  "Approval Rate", "Approval Rate", "Absolute P95", "Absolute P95"],
+        "Severity": ["warning", "critical", "warning", "critical",
+                      "warning", "critical", "warning", "critical"],
+        "Condition": [
+            "Hourly P95 > 2x baseline", "Hourly P95 > 3x baseline",
+            "Timeout rate > 5%", "Timeout rate > 10%",
+            "Approval rate < 70%", "Approval rate < 60%",
+            "P95 > 5,000ms", "P95 > 8,000ms",
+        ],
+    }
+    st.dataframe(pd.DataFrame(config_data), use_container_width=True, hide_index=True)
+
+    # Alerts by type
+    st.subheader("Alerts by Type")
+    if summary["by_type"]:
+        type_df = pd.DataFrame([
+            {"type": k, "count": v} for k, v in summary["by_type"].items()
+        ])
+        fig_type = px.bar(
+            type_df, x="type", y="count",
+            color_discrete_sequence=["#636EFA"],
+        )
+        fig_type.update_layout(
+            xaxis_title="Alert Type", yaxis_title="Count", height=300,
+        )
+        st.plotly_chart(fig_type, use_container_width=True)
